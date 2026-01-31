@@ -40,8 +40,10 @@ class ShadowRemovalModel(BaseModel):
                                 help='weight for physical reconstruction loss')
             parser.add_argument('--lambda_gan', type=float, default=1.0,
                                 help='weight for adversarial loss')
-            parser.add_argument('--lambda_decomp', type=float, default=1.0,
+            parser.add_argument('--lambda_decomp', type=float, default=0.3,
                                 help='weight for decomposition loss')
+            parser.add_argument('--mask_weight_factor', type=float, default=2.0,
+                                help='extra weight for shadow regions in physical loss')
             parser.add_argument('--log_eps', type=float, default=1e-4,
                                 help='epsilon for log transform to avoid log(0)')
             parser.add_argument('--decomp_temp', type=float, default=0.5,
@@ -175,7 +177,8 @@ class ShadowRemovalModel(BaseModel):
         self.loss_G_Physical = 0
 
         mask_weight = (self.mask + 1.0) * 0.5
-        pixel_weight = 1.0 + mask_weight * 4.0
+        mask_weight_factor = self.opt.mask_weight_factor if hasattr(self.opt, 'mask_weight_factor') else 2.0
+        pixel_weight = 1.0 + mask_weight * mask_weight_factor
 
         # 遍历所有中间结果
         for fake_j in self.intermediate_Js:
