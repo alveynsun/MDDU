@@ -504,19 +504,28 @@ class UnetSkipConnectionBlock(nn.Module):
         upnorm = norm_layer(outer_nc)
 
         if outermost:
-            upconv = nn.ConvTranspose2d(inner_nc * 2, outer_nc, kernel_size=4, stride=2, padding=1)
+            upconv = nn.Sequential(
+                nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+                nn.Conv2d(inner_nc * 2, outer_nc, kernel_size=3, padding=1, bias=use_bias),
+            )
             down = [downconv]
             up = [uprelu, upconv]
             if use_tanh:
                 up.append(nn.Tanh())
             model = down + [submodule] + up
         elif innermost:
-            upconv = nn.ConvTranspose2d(inner_nc, outer_nc, kernel_size=4, stride=2, padding=1, bias=use_bias)
+            upconv = nn.Sequential(
+                nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+                nn.Conv2d(inner_nc, outer_nc, kernel_size=3, padding=1, bias=use_bias),
+            )
             down = [downrelu, downconv]
             up = [uprelu, upconv, upnorm]
             model = down + up
         else:
-            upconv = nn.ConvTranspose2d(inner_nc * 2, outer_nc, kernel_size=4, stride=2, padding=1, bias=use_bias)
+            upconv = nn.Sequential(
+                nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+                nn.Conv2d(inner_nc * 2, outer_nc, kernel_size=3, padding=1, bias=use_bias),
+            )
             down = [downrelu, downconv, downnorm]
             up = [uprelu, upconv, upnorm]
 
@@ -844,7 +853,9 @@ class UnfoldingGenerator(nn.Module):
             A_log_norm = (A_log * scale_factor) + 1.0
 
             jnet_input = torch.cat([S_log_norm, A_log_norm, beta], dim=1)
-            J_log = jnet(jnet_input)
+            J_out_tanh = jnet(jnet_input)
+            J_out_norm = (J_out_tanh + 1.0) / 2.0
+            J_log = (J_out_norm - 1.0) / scale_factor
 
             # 保存这一步的 J_log
             all_J_logs.append(J_log)
