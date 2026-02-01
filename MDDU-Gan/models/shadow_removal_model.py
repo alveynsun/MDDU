@@ -40,8 +40,14 @@ class ShadowRemovalModel(BaseModel):
                                 help='weight for physical reconstruction loss')
             parser.add_argument('--lambda_gan', type=float, default=1.0,
                                 help='weight for adversarial loss')
+            parser.add_argument('--lambda_decomp', type=float, default=0.3,
+                                help='weight for decomposition loss')
+            parser.add_argument('--mask_weight_factor', type=float, default=2.0,
+                                help='extra weight for shadow regions in physical loss')
             parser.add_argument('--log_eps', type=float, default=1e-4,
                                 help='epsilon for log transform to avoid log(0)')
+            parser.add_argument('--decomp_temp', type=float, default=0.5,
+                                help='temperature for soft valid region in decomposition loss')
             parser.add_argument('--share_weights', action='store_true',
                                 help='share weights across unfolding iterations')
 
@@ -82,9 +88,9 @@ class ShadowRemovalModel(BaseModel):
 
         if self.isTrain:
             # Define the discriminator
-            # Discriminator takes shadow-free image (3 channels)
+            # Discriminator takes concatenated (shadow, shadow-free) pairs
             self.netD = networks.define_D(
-                opt.output_nc, opt.ndf, opt.netD,
+                opt.input_nc + opt.output_nc, opt.ndf, opt.netD,
                 opt.n_layers_D, opt.norm, opt.init_type, opt.init_gain
             )
 
@@ -114,7 +120,12 @@ class ShadowRemovalModel(BaseModel):
             'mask': shadow mask tensor (optional)
             'shadow_paths': image file paths
         """
-        self.shadow = input['shadow'].to(self.device)
+        if 'shadow' in input:
+            self.shadow = input['shadow'].to(self.device)
+            self.image_paths = input['shadow_paths']
+        else:
+            self.shadow = input['A'].to(self.device)
+            self.image_paths = input['A_paths']
 
         if 'gt' in input:
             self.real = input['gt'].to(self.device)
@@ -126,7 +137,8 @@ class ShadowRemovalModel(BaseModel):
             # Create all-ones mask if not provided
             self.mask = torch.ones_like(self.shadow[:, :1])
 
-        self.image_paths = input['shadow_paths']
+        if 'shadow_paths' in input:
+            self.image_paths = input['shadow_paths']
 
     def forward(self):
 
@@ -140,11 +152,13 @@ class ShadowRemovalModel(BaseModel):
     def backward_D(self):
         """Calculate GAN loss for the discriminator"""
         # Fake; stop backprop to the generator by detaching fake
-        pred_fake = self.netD(self.fake.detach())
+        fake_pair = torch.cat([self.shadow, self.fake.detach()], dim=1)
+        pred_fake = self.netD(fake_pair)
         self.loss_D_fake = self.criterionGAN(pred_fake, False)
 
         # Real
-        pred_real = self.netD(self.real)
+        real_pair = torch.cat([self.shadow, self.real], dim=1)
+        pred_real = self.netD(real_pair)
         self.loss_D_real = self.criterionGAN(pred_real, True)
 
         # Combined loss and calculate gradients
@@ -154,14 +168,17 @@ class ShadowRemovalModel(BaseModel):
     def backward_G(self):
         """Calculate GAN and physical losses for the generator"""
         # 1. GAN Loss
-        pred_fake = self.netD(self.fake)
+        fake_pair = torch.cat([self.shadow, self.fake], dim=1)
+        pred_fake = self.netD(fake_pair)
         self.loss_G_GAN = self.criterionGAN(pred_fake, True)
 
         # ================== 修改开始 ==================
         # 2. Physical Reconstruction Loss (中间监督)
         self.loss_G_Physical = 0
 
-        pixel_weight = 1.0 + self.mask * 4.0
+        mask_weight = (self.mask + 1.0) * 0.5
+        mask_weight_factor = self.opt.mask_weight_factor if hasattr(self.opt, 'mask_weight_factor') else 2.0
+        pixel_weight = 1.0 + mask_weight * mask_weight_factor
 
         # 遍历所有中间结果
         for fake_j in self.intermediate_Js:
@@ -178,14 +195,15 @@ class ShadowRemovalModel(BaseModel):
         diff_log = torch.abs(self.last_J_log + self.A_log - self.S_log)
 
 
-        valid_region = (self.S_log > -4.6).float().detach()
+        decomp_temp = self.opt.decomp_temp if hasattr(self.opt, 'decomp_temp') else 0.5
+        valid_region = torch.sigmoid((self.S_log + 4.6) / decomp_temp).detach()
 
         self.loss_G_Decomp = torch.sum(diff_log * valid_region) / (torch.sum(valid_region) + 1e-8)
 
         # 4. 组合 Loss
         lambda_physical = self.opt.lambda_physical if hasattr(self.opt, 'lambda_physical') else 10.0
         lambda_gan = self.opt.lambda_gan if hasattr(self.opt, 'lambda_gan') else 1.0
-        lambda_decomp = 1.0  # 建议保持较小
+        lambda_decomp = self.opt.lambda_decomp if hasattr(self.opt, 'lambda_decomp') else 1.0
 
         self.loss_G = lambda_gan * self.loss_G_GAN + \
                       lambda_physical * self.loss_G_Physical + \
