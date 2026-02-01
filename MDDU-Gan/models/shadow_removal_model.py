@@ -31,14 +31,14 @@ class ShadowRemovalModel(BaseModel):
         parser.set_defaults(input_nc=3, output_nc=3)
 
         if is_train:
-            parser.set_defaults(pool_size=0, gan_mode='lsgan')
+            parser.set_defaults(pool_size=50, gan_mode='lsgan')
             parser.add_argument('--num_iterations', type=int, default=3,
                                 help='K iterations in unfolding process')
             parser.add_argument('--use_mask', action='store_true',
                                 help='use shadow mask if available')
-            parser.add_argument('--lambda_physical', type=float, default=10.0,
+            parser.add_argument('--lambda_physical', type=float, default=5.0,
                                 help='weight for physical reconstruction loss')
-            parser.add_argument('--lambda_gan', type=float, default=1.0,
+            parser.add_argument('--lambda_gan', type=float, default=5.0,
                                 help='weight for adversarial loss')
             parser.add_argument('--lambda_decomp', type=float, default=0.3,
                                 help='weight for decomposition loss')
@@ -103,7 +103,7 @@ class ShadowRemovalModel(BaseModel):
                 self.netG.parameters(), lr=opt.lr, betas=(opt.beta1, 0.999)
             )
             self.optimizer_D = torch.optim.Adam(
-                self.netD.parameters(), lr=opt.lr, betas=(opt.beta1, 0.999)
+                self.netD.parameters(), lr=opt.lr * 0.5, betas=(opt.beta1, 0.999)
             )
             self.optimizers.append(self.optimizer_G)
             self.optimizers.append(self.optimizer_D)
@@ -167,13 +167,11 @@ class ShadowRemovalModel(BaseModel):
 
     def backward_G(self):
         """Calculate GAN and physical losses for the generator"""
-        # 1. GAN Loss
+
         fake_pair = torch.cat([self.shadow, self.fake], dim=1)
         pred_fake = self.netD(fake_pair)
         self.loss_G_GAN = self.criterionGAN(pred_fake, True)
 
-        # ================== 修改开始 ==================
-        # 2. Physical Reconstruction Loss (中间监督)
         self.loss_G_Physical = 0
 
         mask_weight = (self.mask + 1.0) * 0.5
