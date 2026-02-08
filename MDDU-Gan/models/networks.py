@@ -360,27 +360,24 @@ class UnetSkipConnectionBlock(nn.Module):
         upnorm = norm_layer(outer_nc)
 
         if outermost:
-            upconv = nn.Sequential(
-                nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
-                nn.Conv2d(inner_nc * 2, outer_nc, kernel_size=3, padding=1, bias=use_bias),
-            )
+            upconv = nn.ConvTranspose2d(inner_nc * 2, outer_nc, kernel_size=4, stride=2, padding=1)
             down = [downconv]
             up = [uprelu, upconv]
             if use_tanh:
                 up.append(nn.Tanh())
             model = down + [submodule] + up
         elif innermost:
-            upconv = nn.Sequential(
-                nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
-                nn.Conv2d(inner_nc, outer_nc, kernel_size=3, padding=1, bias=use_bias),
+            upconv = nn.ConvTranspose2d(
+                inner_nc, outer_nc,
+                kernel_size=4, stride=2, padding=1, bias=use_bias
             )
             down = [downrelu, downconv]
             up = [uprelu, upconv, upnorm]
             model = down + up
         else:
-            upconv = nn.Sequential(
-                nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
-                nn.Conv2d(inner_nc * 2, outer_nc, kernel_size=3, padding=1, bias=use_bias),
+            upconv = nn.ConvTranspose2d(
+                inner_nc * 2, outer_nc,
+                kernel_size=4, stride=2, padding=1, bias=use_bias
             )
             down = [downrelu, downconv, downnorm]
             up = [uprelu, upconv, upnorm]
@@ -633,7 +630,7 @@ class JNet(nn.Module):
 class UnfoldingGenerator(nn.Module):
 
     def __init__(self, num_iterations=3, ngf=64, norm_layer=nn.BatchNorm2d,
-                 use_dropout=False, log_eps=1e-4, share_weights=False):
+                 use_dropout=False, log_eps=1e-2, share_weights=False):
 
         super(UnfoldingGenerator, self).__init__()
         self.num_iterations = num_iterations
@@ -666,26 +663,35 @@ class UnfoldingGenerator(nn.Module):
     def forward(self, shadow, mask=None):
         batch_size = shadow.shape[0]
 
-        # 1. Mask 处理 (无需修改，二值掩码会自动归一化为 -1/1)
         if mask is None:
             mask = torch.ones(batch_size, 1, shadow.shape[2], shadow.shape[3],
                               device=shadow.device)
 
+
         S_normalized = (shadow + 1.0) / 2.0
-        S_log = torch.log(S_normalized.clamp(min=self.log_eps) + self.log_eps)
-        scale_factor = -1.0 / torch.log(torch.tensor(self.log_eps))
-        scale_factor = scale_factor.to(shadow.device)
+
+
+        safe_eps = 1e-2
+
+        S_log = torch.log(S_normalized.clamp(min=safe_eps))
+
+        min_val = torch.log(torch.tensor(safe_eps)).to(shadow.device)
+        max_val = 0.0  # log(1.0)
+
+
+        S_log_norm = (S_log - min_val) / (max_val - min_val) * 2.0 - 1.0
+
 
         alpha, beta = self.hypernet(shadow, mask)
 
         # 4. 初始化
-        J_log = S_log.clone()
-        A_log = torch.zeros_like(S_log)
+        J_log_norm = S_log_norm.clone()
 
-        # 用于收集中间结果的列表
+        A_log_norm = torch.zeros_like(S_log_norm)
+
         all_J_logs = []
 
-        # 5. 迭代优化
+
         for k in range(self.num_iterations):
             if self.share_weights:
                 anet = self.anet
@@ -694,38 +700,32 @@ class UnfoldingGenerator(nn.Module):
                 anet = self.anets[k]
                 jnet = self.jnets[k]
 
-            # Update A (Illumination)
-            S_log_norm = (S_log * scale_factor) + 1.0
-            J_log_norm = (J_log * scale_factor) + 1.0
 
-            # 使用归一化后的特征拼接
             anet_input = torch.cat([S_log_norm, J_log_norm, alpha], dim=1)
+            A_out_tanh = anet(anet_input)  # 输出 [-1, 1]
+            A_log_norm = A_out_tanh
 
-            A_out_tanh = anet(anet_input)
-
-
-            A_out_norm = (A_out_tanh + 1.0) / 2.0
-
-            A_log = (A_out_norm - 1.0) / scale_factor
-
-            A_log_norm = (A_log * scale_factor) + 1.0
 
             jnet_input = torch.cat([S_log_norm, A_log_norm, beta], dim=1)
-
-            J_out_tanh = jnet(jnet_input)
-            J_out_norm = (J_out_tanh + 1.0) / 2.0
-            J_log = (J_out_norm - 1.0) / scale_factor
+            J_out_tanh = jnet(jnet_input)  # 输出 [-1, 1]
+            J_log_norm = J_out_tanh
 
 
-            all_J_logs.append(J_log)
+            J_log_restored = (J_log_norm + 1.0) / 2.0 * (max_val - min_val) + min_val
+            all_J_logs.append(J_log_restored)
 
         all_J_finals = []
         for j_log_item in all_J_logs:
 
-            j_norm = torch.exp(j_log_item) - self.log_eps
-            # [0, 1] -> [-1, 1]
-            j_final = j_norm * 2.0 - 1.0
+            j_linear = torch.exp(j_log_item)
+
+            j_final = j_linear * 2.0 - 1.0
+
+            j_final = torch.clamp(j_final, -1.0, 1.0)
             all_J_finals.append(j_final)
 
 
-        return all_J_finals[-1], all_J_finals, all_J_logs[-1], A_log, S_log
+        A_log_restored = (A_log_norm + 1.0) / 2.0 * (max_val - min_val) + min_val
+
+
+        return all_J_finals[-1], all_J_finals, all_J_logs[-1], A_log_restored, S_log
