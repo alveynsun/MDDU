@@ -12,12 +12,12 @@ class ShadowRemovalModel(BaseModel):
 
         parser.set_defaults(norm='instance', dataset_mode='shadow')
         parser.set_defaults(input_nc=3, output_nc=3)
-
+        parser.add_argument('--share_weights', action='store_true', help='share weights')
+        parser.add_argument('--num_iterations', type=int, default=3, help='K iterations')
+        parser.add_argument('--log_eps', type=float, default=1e-4, help='log epsilon')
         if is_train:
 
             parser.set_defaults(pool_size=50, gan_mode='lsgan')
-            parser.add_argument('--num_iterations', type=int, default=3,
-                                help='K iterations in unfolding process')
             parser.add_argument('--use_mask', action='store_true',
                                 help='use shadow mask if available')
             parser.add_argument('--lambda_physical', type=float, default=10.0,
@@ -29,12 +29,8 @@ class ShadowRemovalModel(BaseModel):
                                 help='weight for decomposition loss')
             parser.add_argument('--mask_weight_factor', type=float, default=2.0,
                                 help='extra weight for shadow regions in physical loss')
-            parser.add_argument('--log_eps', type=float, default=1e-4,
-                                help='epsilon for log transform to avoid log(0)')
             parser.add_argument('--decomp_temp', type=float, default=0.5,
                                 help='temperature for soft valid region in decomposition loss')
-            parser.add_argument('--share_weights', action='store_true',
-                                help='share weights across unfolding iterations')
 
         return parser
 
@@ -85,7 +81,7 @@ class ShadowRemovalModel(BaseModel):
                 self.netG.parameters(), lr=opt.lr, betas=(opt.beta1, 0.999)
             )
             self.optimizer_D = torch.optim.Adam(
-                self.netD.parameters(), lr=opt.lr, betas=(opt.beta1, 0.999)
+                self.netD.parameters(), lr=opt.lr * 0.25, betas=(opt.beta1, 0.999)
             )
             self.optimizers.append(self.optimizer_G)
             self.optimizers.append(self.optimizer_D)
@@ -120,16 +116,14 @@ class ShadowRemovalModel(BaseModel):
 
     def backward_D(self):
 
-        fake_B = self.fake_pool.query(self.fake)
+        fake_B = self.fake.detach()
 
-        pred_fake = self.netD(fake_B.detach())
+        pred_fake = self.netD(fake_B)
         self.loss_D_fake = self.criterionGAN(pred_fake, False)
 
         pred_real = self.netD(self.real)
 
-        target_real = torch.tensor(0.9).to(self.device).expand_as(pred_real)
-
-        self.loss_D_real = self.criterionGAN.loss(pred_real, target_real)
+        self.loss_D_real = self.criterionGAN(pred_real, True)
 
         self.loss_D = (self.loss_D_fake + self.loss_D_real) * 0.5
         self.loss_D.backward()
@@ -137,28 +131,34 @@ class ShadowRemovalModel(BaseModel):
     def backward_G(self):
 
         pred_fake = self.netD(self.fake)
-        target_real = torch.tensor(0.9).to(self.device).expand_as(pred_fake)
-        self.loss_G_GAN = self.criterionGAN.loss(pred_fake, target_real)
+
+        self.loss_G_GAN = self.criterionGAN(pred_fake, True)  # True 代表目标是 1.0
+
 
         self.loss_G_Physical = 0
         mask_weight = (self.mask + 1.0) * 0.5
         mask_weight_factor = self.opt.mask_weight_factor if hasattr(self.opt, 'mask_weight_factor') else 2.0
         pixel_weight = 1.0 + mask_weight * mask_weight_factor
 
-        for fake_j in self.intermediate_Js:
+
+        iter_weights = [0.1, 0.2, 1.0]
+
+        for i, fake_j in enumerate(self.intermediate_Js):
             abs_diff = torch.abs(fake_j - self.real)
             weighted_loss = torch.mean(abs_diff * pixel_weight)
-            self.loss_G_Physical += weighted_loss
+            w = iter_weights[i] if i < len(iter_weights) else 1.0
+            self.loss_G_Physical += weighted_loss * w
 
-        self.loss_G_Physical = self.loss_G_Physical / len(self.intermediate_Js)
 
-        # 3. Decomp Loss
         diff_log = torch.abs(self.last_J_log + self.A_log - self.S_log)
+
         decomp_temp = self.opt.decomp_temp if hasattr(self.opt, 'decomp_temp') else 0.5
+
         valid_region = torch.sigmoid((self.S_log + 4.6) / decomp_temp).detach()
+
         self.loss_G_Decomp = torch.sum(diff_log * valid_region) / (torch.sum(valid_region) + 1e-8)
 
-        # 4. 组合 Loss
+        # 4. 组合 Total Loss
         lambda_physical = self.opt.lambda_physical if hasattr(self.opt, 'lambda_physical') else 10.0
         lambda_gan = self.opt.lambda_gan if hasattr(self.opt, 'lambda_gan') else 1.0
         lambda_decomp = self.opt.lambda_decomp if hasattr(self.opt, 'lambda_decomp') else 1.0
