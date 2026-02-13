@@ -485,30 +485,54 @@ class PixelDiscriminator(nn.Module):
 ##############################################################################
 
 
+class MaskGuidedAttention(nn.Module):
+ 
+    def __init__(self, feature_nc=3, ngf=32):
+        super(MaskGuidedAttention, self).__init__()
+        # 输入: mask(1) + feature(feature_nc)
+        self.net = nn.Sequential(
+            nn.Conv2d(1 + feature_nc, ngf, kernel_size=3, stride=1, padding=1),
+            nn.InstanceNorm2d(ngf),
+            nn.ReLU(True),
+            nn.Conv2d(ngf, ngf, kernel_size=3, stride=1, padding=1),
+            nn.InstanceNorm2d(ngf),
+            nn.ReLU(True),
+            nn.Conv2d(ngf, 1, kernel_size=1, stride=1, padding=0),
+            nn.Sigmoid()
+        )
+
+    def forward(self, mask, feature):
+        """
+        Parameters:
+            mask (tensor)    -- shadow mask [B, 1, H, W]
+            feature (tensor) -- 当前迭代的特征图 [B, C, H, W]
+        Returns:
+            attention (tensor) -- 空间注意力图 [B, 1, H, W], 值域[0,1]
+        """
+        x = torch.cat([mask, feature], dim=1)
+        return self.net(x)
+
+
 class HyperNet(nn.Module):
     """HyperNet generates adaptive parameters (alpha, beta) from input.
 
     Uses a ResNet-18 encoder backbone with dual heads to produce parameter maps
     that guide the iterative shadow removal process.
-    """
+    
 
-    def __init__(self, input_nc=4, ngf=64, norm_layer=nn.BatchNorm2d):
-        """Construct HyperNet.
+    def __init__(self, input_nc=4, extra_nc=0, ngf=64, norm_layer=nn.BatchNorm2d):
 
-        Parameters:
-            input_nc (int) -- number of input channels (shadow image + mask = 4)
-            ngf (int) -- number of filters in the first conv layer
-            norm_layer -- normalization layer
-        """
         super(HyperNet, self).__init__()
         if type(norm_layer) == functools.partial:
             use_bias = norm_layer.func == nn.InstanceNorm2d
         else:
             use_bias = norm_layer == nn.InstanceNorm2d
 
+        total_input_nc = input_nc + extra_nc
+
         # Encoder (ResNet-18 style)
         self.encoder = nn.Sequential(
-            nn.Conv2d(input_nc, ngf, kernel_size=7, stride=2, padding=3, bias=use_bias),
+            nn.Conv2d(total_input_nc, ngf, kernel_size=7, stride=2, padding=3, bias=use_bias),
             norm_layer(ngf),
             nn.ReLU(True),
             nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
@@ -541,18 +565,12 @@ class HyperNet(nn.Module):
             nn.Sigmoid()  # Constrain beta to [0, 1]
         )
 
-    def forward(self, shadow, mask):
-        """Forward pass.
+    def forward(self, shadow, mask, j_current=None):
 
-        Parameters:
-            shadow (tensor) -- shadow image [B, 3, H, W]
-            mask (tensor) -- shadow mask [B, 1, H, W]
-
-        Returns:
-            alpha (tensor) -- parameter map for A-Net [B, 1, H, W]
-            beta (tensor) -- parameter map for J-Net [B, 1, H, W]
-        """
-        x = torch.cat([shadow, mask], dim=1)  # Concatenate along channel dimension
+        if j_current is not None:
+            x = torch.cat([shadow, mask, j_current], dim=1)
+        else:
+            x = torch.cat([shadow, mask], dim=1)
         features = self.encoder(x)
         alpha = self.alpha_head(features)
         beta = self.beta_head(features)
@@ -630,25 +648,45 @@ class JNet(nn.Module):
 class UnfoldingGenerator(nn.Module):
 
     def __init__(self, num_iterations=3, ngf=64, norm_layer=nn.BatchNorm2d,
-                 use_dropout=False, log_eps=1e-2, share_weights=False):
+                 use_dropout=False, log_eps=1e-4, share_weights=False):
 
         super(UnfoldingGenerator, self).__init__()
         self.num_iterations = num_iterations
         self.log_eps = log_eps
         self.share_weights = share_weights
 
-        # HyperNet to generate adaptive parameters
-        self.hypernet = HyperNet(input_nc=4, ngf=ngf, norm_layer=norm_layer)
+
+        if share_weights:
+            self.hypernet = HyperNet(input_nc=4, extra_nc=3, ngf=ngf, norm_layer=norm_layer)
+        else:
+            self.hypernets = nn.ModuleList([
+                HyperNet(input_nc=4, extra_nc=3, ngf=ngf, norm_layer=norm_layer)
+                for _ in range(num_iterations)
+            ])
+
+    
+        if share_weights:
+            self.mask_attn = MaskGuidedAttention(feature_nc=3, ngf=32)
+        else:
+            self.mask_attns = nn.ModuleList([
+                MaskGuidedAttention(feature_nc=3, ngf=32)
+                for _ in range(num_iterations)
+            ])
+
+        self.residual_scale_A = nn.ParameterList([
+            nn.Parameter(torch.tensor(0.1)) for _ in range(num_iterations)
+        ])
+        self.residual_scale_J = nn.ParameterList([
+            nn.Parameter(torch.tensor(0.1)) for _ in range(num_iterations)
+        ])
 
         # Create A-Net and J-Net
         if share_weights:
-            # Single pair of networks shared across all iterations
             self.anet = ANet(input_nc=7, output_nc=3, ngf=ngf,
                              norm_layer=norm_layer, use_dropout=use_dropout)
             self.jnet = JNet(input_nc=7, output_nc=3, ngf=ngf,
                              norm_layer=norm_layer, use_dropout=use_dropout)
         else:
-            # Separate networks for each iteration
             self.anets = nn.ModuleList([
                 ANet(input_nc=7, output_nc=3, ngf=ngf,
                      norm_layer=norm_layer, use_dropout=use_dropout)
@@ -668,64 +706,68 @@ class UnfoldingGenerator(nn.Module):
                               device=shadow.device)
 
 
-        S_normalized = (shadow + 1.0) / 2.0
+        S_normalized = (shadow + 1.0) / 2.0  # [-1,1] → [0,1]
 
-
-        safe_eps = 1e-2
+        safe_eps = max(self.log_eps, 1e-6)  # 下限保护，防止log(0)
 
         S_log = torch.log(S_normalized.clamp(min=safe_eps))
 
-        min_val = torch.log(torch.tensor(safe_eps)).to(shadow.device)
+        min_val = torch.log(torch.tensor(safe_eps, device=shadow.device, dtype=shadow.dtype))
         max_val = 0.0  # log(1.0)
 
+        # 归一化到 [-1, 1]
+        log_range = max_val - min_val
+        S_log_norm = (S_log - min_val) / log_range * 2.0 - 1.0
 
-        S_log_norm = (S_log - min_val) / (max_val - min_val) * 2.0 - 1.0
-
-
-        alpha, beta = self.hypernet(shadow, mask)
-
-        # 4. 初始化
+        # 初始化
         J_log_norm = S_log_norm.clone()
-
         A_log_norm = torch.zeros_like(S_log_norm)
 
         all_J_logs = []
 
-
         for k in range(self.num_iterations):
+            # 选择当前迭代的网络
             if self.share_weights:
                 anet = self.anet
                 jnet = self.jnet
+                hypernet = self.hypernet
+                mask_attn = self.mask_attn
             else:
                 anet = self.anets[k]
                 jnet = self.jnets[k]
+                hypernet = self.hypernets[k]
+                mask_attn = self.mask_attns[k]
 
+            J_current_for_hyper = ((J_log_norm + 1.0) / 2.0 * log_range + min_val).exp()
+            J_current_for_hyper = (J_current_for_hyper * 2.0 - 1.0).clamp(-1.0, 1.0)
+            alpha, beta = hypernet(shadow, mask, J_current_for_hyper.detach())
 
+            attn_map = mask_attn(mask, J_log_norm.detach())  # [B,1,H,W]
+
+        
             anet_input = torch.cat([S_log_norm, J_log_norm, alpha], dim=1)
-            A_out_tanh = anet(anet_input)  # 输出 [-1, 1]
-            A_log_norm = A_out_tanh
-
+            A_delta = anet(anet_input)  # 输出 [-1, 1], 作为残差增量
+            A_log_norm = A_log_norm + self.residual_scale_A[k] * attn_map * A_delta
+            A_log_norm = A_log_norm.clamp(-1.0, 1.0)  # 保持数值范围
 
             jnet_input = torch.cat([S_log_norm, A_log_norm, beta], dim=1)
-            J_out_tanh = jnet(jnet_input)  # 输出 [-1, 1]
-            J_log_norm = J_out_tanh
+            J_delta = jnet(jnet_input)  # 输出 [-1, 1], 作为残差增量
+            J_log_norm = J_log_norm + self.residual_scale_J[k] * attn_map * J_delta
+            J_log_norm = J_log_norm.clamp(-1.0, 1.0)
 
-
-            J_log_restored = (J_log_norm + 1.0) / 2.0 * (max_val - min_val) + min_val
+            # 记录每轮迭代的J (还原到log空间)
+            J_log_restored = (J_log_norm + 1.0) / 2.0 * log_range + min_val
             all_J_logs.append(J_log_restored)
 
+        # 将所有迭代的J从log空间转回图像空间 [-1, 1]
         all_J_finals = []
         for j_log_item in all_J_logs:
-
             j_linear = torch.exp(j_log_item)
-
             j_final = j_linear * 2.0 - 1.0
-
             j_final = torch.clamp(j_final, -1.0, 1.0)
             all_J_finals.append(j_final)
 
-
-        A_log_restored = (A_log_norm + 1.0) / 2.0 * (max_val - min_val) + min_val
-
+        # 还原A到log空间
+        A_log_restored = (A_log_norm + 1.0) / 2.0 * log_range + min_val
 
         return all_J_finals[-1], all_J_finals, all_J_logs[-1], A_log_restored, S_log
