@@ -252,9 +252,11 @@ class VGGPerceptualLoss(torch.nn.Module):
             from torchvision.models import vgg16
             vgg = vgg16(pretrained=True).features
 
-        self.slice1 = torch.nn.Sequential(*list(vgg.children())[:4])
-        self.slice2 = torch.nn.Sequential(*list(vgg.children())[4:9])
-        self.slice3 = torch.nn.Sequential(*list(vgg.children())[9:16])
+        self.slice1 = torch.nn.Sequential(*list(vgg.children())[:4])   # relu1_2
+        self.slice2 = torch.nn.Sequential(*list(vgg.children())[4:9])  # relu2_2
+        self.slice3 = torch.nn.Sequential(*list(vgg.children())[9:16]) # relu3_3
+        
+        self.weights = [1.0 / 32, 1.0 / 16, 1.0 / 8]
 
         for param in self.parameters():
             param.requires_grad = False
@@ -272,9 +274,9 @@ class VGGPerceptualLoss(torch.nn.Module):
 
         loss = 0
         x_fake, x_real = fake_norm, real_norm
-        for slice_layer in [self.slice1, self.slice2, self.slice3]:
+        for i, slice_layer in enumerate([self.slice1, self.slice2, self.slice3]):
             x_fake = slice_layer(x_fake)
             x_real = slice_layer(x_real)
-            loss += torch.nn.functional.l1_loss(x_fake, x_real.detach())
+            loss += self.weights[i] * torch.nn.functional.l1_loss(x_fake, x_real.detach())
 
         return loss
