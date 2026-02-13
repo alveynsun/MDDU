@@ -41,18 +41,7 @@ def get_norm_layer(norm_type="instance"):
 
 
 def get_scheduler(optimizer, opt):
-    """Return a learning rate scheduler
 
-    Parameters:
-        optimizer          -- the optimizer of the network
-        opt (option class) -- stores all the experiment flags; needs to be a subclass of BaseOptions．
-                              opt.lr_policy is the name of learning rate policy: linear | step | plateau | cosine
-
-    For 'linear', we keep the same learning rate for the first <opt.n_epochs> epochs
-    and linearly decay the rate to zero over the next <opt.n_epochs_decay> epochs.
-    For other schedulers (step, plateau, and cosine), we use the default PyTorch schedulers.
-    See https://pytorch.org/docs/stable/optim.html for more details.
-    """
     if opt.lr_policy == "linear":
 
         def lambda_rule(epoch):
@@ -222,11 +211,7 @@ def cal_gradient_penalty(netD, real_data, fake_data, device, type="mixed", const
 
 
 class ResnetGenerator(nn.Module):
-    """Resnet-based generator that consists of Resnet blocks between a few downsampling/upsampling operations.
-
-    We adapt Torch code and idea from Justin Johnson's neural style transfer project(https://github.com/jcjohnson/fast-neural-style)
-    """
-
+ 
     def __init__(self, input_nc, output_nc, ngf=64, norm_layer=nn.BatchNorm2d, use_dropout=False, n_blocks=6,
                  padding_type="reflect"):
 
@@ -478,12 +463,8 @@ class PixelDiscriminator(nn.Module):
 # Shadow Removal Networks
 ##############################################################################
 
-
-
-
 class HyperNet(nn.Module):
-
-
+    
     def __init__(self, input_nc=4, extra_nc=0, ngf=64, norm_layer=nn.BatchNorm2d):
       
         super(HyperNet, self).__init__()
